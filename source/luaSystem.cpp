@@ -1136,6 +1136,9 @@ static int lua_listCia(lua_State *L){
 		lua_pushinteger(L, (TitleIDs[i-1].platform));
 		lua_settable(L, -3);
 		u64 id = TitleIDs[i-1].uniqueid | ((u64)TitleIDs[i-1].category << 32) | ((u64)TitleIDs[i-1].platform << 48);
+		lua_pushstring(L, "title_id");
+		lua_pushnumber(L, id);
+		lua_settable(L, -3);
 		char product_id[16];
 		AM_GetTitleProductCode(MEDIATYPE_SD, id, product_id);
 		lua_pushstring(L, "product_id");
@@ -1172,6 +1175,9 @@ static int lua_listCia(lua_State *L){
 		lua_pushinteger(L, (TitleIDs[i-1].platform));
 		lua_settable(L, -3);
 		u64 id = TitleIDs[i-1].uniqueid | ((u64)TitleIDs[i-1].category << 32) | ((u64)TitleIDs[i-1].platform << 48);
+		lua_pushstring(L, "title_id");
+		lua_pushnumber(L, id);
+		lua_settable(L, -3);
 		char product_id[16];
 		AM_GetTitleProductCode(MEDIATYPE_NAND, id, product_id);
 		lua_pushstring(L, "product_id");
