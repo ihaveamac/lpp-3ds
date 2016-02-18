@@ -6,7 +6,6 @@ ifeq ($(strip $(DEVKITARM)),)
 $(error "Please set DEVKITARM in your environment. export DEVKITARM=<path to>devkitARM")
 endif
 
-LPP_CTRULIB ?= $(CURDIR)/libctru
 LPP_LIBS ?= $(CURDIR)/source
 TOPDIR ?= $(CURDIR)
 include $(DEVKITARM)/3ds_rules
@@ -31,13 +30,13 @@ include $(DEVKITARM)/3ds_rules
 TARGET		:=	$(notdir $(CURDIR))
 BUILD		:=	build
 SOURCES		:=	source/include/lua	source source/include source/include/graphics \
-				source/include/ftp source/include/sf2d source/include/ogg \
+				source/include/ftp source/include/sf2d \
 				source/include/lodepng/	source/include/unrar/	source/include/libjpeg \
-				source/include/ttf source/include/khax
+				source/include/ttf source/include/brahma source/include/khax
 DATA		:=	data
-INCLUDES	:=	include
+INCLUDES	:=	source/include
 
-APP_TITLE	:=	Lua Player Plus
+APP_TITLE	:=	Lua Player Plus 3DS
 APP_AUTHOR	:=	Rinnegatamante
 APP_DESCRIPTION	:=	Lua Interpreter for 3DS
 #---------------------------------------------------------------------------------
@@ -56,13 +55,13 @@ CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11 -fpermissive  -Wno-
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:= -lctru -lm -lz
+LIBS	:= -lbrahma -lkhax -lsf2d -lctru -lm -lz -logg -lcitro3d -llua -ljpeg
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
 # include and lib
 #---------------------------------------------------------------------------------
-LIBDIRS	:= $(LPP_CTRULIB) $(LPP_LIBS)
+LIBDIRS	:= $(LPP_LIBS)
 
 
 #---------------------------------------------------------------------------------
@@ -159,7 +158,37 @@ $(OUTPUT).elf	:	$(OFILES)
 	@echo $(notdir $<)
 	@$(bin2o)
 
-# WARNING: This is not the right way to do this! TODO: Do it right!
+#---------------------------------------------------------------------------------
+# rules for assembling GPU shaders
+#---------------------------------------------------------------------------------
+define shader-as
+	$(eval CURBIN := $(patsubst %.shbin.o,%.shbin,$(notdir $@)))
+	$(eval ENDFILE := $(patsubst %.v.pica.o,%_shbin.h,$(notdir $@)))
+	picasso -o $(CURBIN) $1
+	bin2s $(CURBIN) | $(AS) -o $@
+	echo "extern const u8" `(echo $(CURBIN) | sed -e 's/^\([0-9]\)/_\1/' | tr . _)`"_end[];" > `(echo $(CURBIN) | tr . _)`.h
+	echo "extern const u8" `(echo $(CURBIN) | sed -e 's/^\([0-9]\)/_\1/' | tr . _)`"[];" >> `(echo $(CURBIN) | tr . _)`.h
+	echo "extern const u32" `(echo $(CURBIN) | sed -e 's/^\([0-9]\)/_\1/' | tr . _)`_size";" >> `(echo $(CURBIN) | tr . _)`.h
+	mv `(echo $(CURBIN) | sed -e 's/^\([0-9]\)/_\1/' | tr . _)`.h $(ENDFILE)
+endef
+
+%.shbin.o : %.v.pica %.g.pica
+	@echo $(notdir $^)
+	@$(call shader-as,$^)
+
+%.v.pica.o : %.v.pica
+	@echo $(notdir $<)
+	@$(call shader-as,$<)
+
+%.shbin.o : %.shlist
+	@echo $(notdir $<)
+	@$(call shader-as,$(foreach file,$(shell cat $<),$(dir $<)/$(file)))
+
+-include $(DEPENDS)
+
+#---------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------------
+
 #---------------------------------------------------------------------------------
 %.vsh.o	:	%.vsh
 #---------------------------------------------------------------------------------

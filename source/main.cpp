@@ -28,6 +28,9 @@
 #- StapleButter for debug font -----------------------------------------------------------------------------------------#
 #- Lode Vandevenne for lodepng -----------------------------------------------------------------------------------------#
 #- Jean-loup Gailly and Mark Adler for zlib ----------------------------------------------------------------------------#
+#- fincs for citro3D ---------------------------------------------------------------------------------------------------#
+#- Myria for libkhax ---------------------------------------------------------------------------------------------------#
+#- Everyone involved in libSu creation ---------------------------------------------------------------------------------#
 #- Special thanks to Aurelio for testing, bug-fixing and various help with codes and implementations -------------------#
 #-----------------------------------------------------------------------------------------------------------------------*/
 
@@ -38,7 +41,8 @@
 #include "include/graphics/Graphics.h"
 #include "include/ftp/ftp.h"
 #include "include/khax/khax.h"
-#include "include/luaAudio.h"
+#include "include/khax/libSu.h"
+#include "include/audio.h"
 
 const char *errMsg;
 unsigned char *buffer;
@@ -48,8 +52,8 @@ bool CIA_MODE;
 bool ftp_state;
 bool isTopLCDOn;
 bool isBottomLCDOn;
-bool isNinjhax2;
-bool csndAccess;
+bool isNinjhax2 = false;
+bool csndAccess = false;
 extern bool audioChannels[32];
 
 int main(int argc, char **argv)
@@ -62,11 +66,14 @@ int main(int argc, char **argv)
 	httpcInit();
 	ptmuInit();
 	hidInit();
+	fsInit();
+	#ifndef CITRA3DS_COMPATIBLE
+		romfsInit();
+	#endif
 	irrstInit();
 	aptOpenSession();
 	Result ret=APT_SetAppCpuTimeLimit(30);
 	aptCloseSession();
-	fsInit();
 	ftp_state = false;
 	isTopLCDOn = true;
 	isBottomLCDOn = true;
@@ -75,20 +82,34 @@ int main(int argc, char **argv)
 	u32 bytesRead;
 	int restore;
 	
-	// Check user build and enables kernel access
-	if (nsInit()==0){
+	// Kernel Privilege Escalation (memchunkhax)
+	Handle testHandle;
+	srvGetServiceHandleDirect(&testHandle, "am:u");
+	if (testHandle){
 		CIA_MODE = true;
-		nsExit();
-	}else CIA_MODE = false;
-	isNinjhax2 = false;
-	if (!hbInit()) khaxInit();
-	else isNinjhax2 = true;
+		svcCloseHandle(testHandle);
+	}else{
+		CIA_MODE = false;
+		if (!hbInit()) khaxInit();
+		else{
+			isNinjhax2 = true;
+			#ifdef USE_MEMCHUNKHAX2
+				u32 fw_id = osGetKernelVersion();
+				u32 major = GET_VERSION_MAJOR(fw_id);
+				u32 minor = GET_VERSION_MINOR(fw_id);
+				u32 rev = GET_VERSION_REVISION(fw_id);
+				if (major <= 2 && minor <= 50 && rev < 11) suInit();
+			#endif
+		}
+	}
 	
 	// Select Audio System (csnd:SND preferred)
-	if (csndInit() == 0){
-		csndAccess = true;
-		csndExit();
-	}else csndAccess = false;
+	#ifndef FORCE_DSP
+		if (csndInit() == 0){
+			csndAccess = true;
+			csndExit();
+		}else csndAccess = false;
+	#endif
 	
 	// Init Audio-Device
 	int i = 0;
@@ -108,32 +129,52 @@ int main(int argc, char **argv)
 			i++;
 		}
 		strcpy(path,&argv[0][5]);
-		path[latest_slash-5] = 0;
+		path[latest_slash-4] = 0;
 		strcpy(start_dir,path);
 		strcpy(cur_dir,path); // Set current dir
-		strcat(path,"/index.lua");
+		strcat(path,"index.lua");
 	}else{
 		strcpy(start_dir,"/");
-		strcpy(cur_dir,"/"); // Set current dir for GW Mode
-		strcpy(path,"/index.lua");
+		strcpy(cur_dir,"/"); // Set current dir for CFW Mode
+		strcat(path,"/index.lua"); // Citra3DS compatibility
 	}
 	
 	while(aptMainLoop())
 	{
 		restore=0;		
 		char error[2048];		
+		unsigned char* buffer = NULL;
 		
-		// Load main script
-		FS_Path filePath=fsMakePath(PATH_ASCII, path);
-		FS_Archive script=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
-		Result ret = FSUSER_OpenFileDirectly(&fileHandle, script, filePath, FS_OPEN_READ, 0x00000000);
-		if (!ret){
-			FSFILE_GetSize(fileHandle, &size);
-			buffer = (unsigned char*)(malloc((size+1) * sizeof (char)));
-			FSFILE_Read(fileHandle, &bytesRead, 0x0, buffer, size);
+		// Load main script (romFs preferred)
+		#ifndef FORCE_SD
+		FILE* script = fopen("romfs:/index.lua","r");
+		if (script == NULL){
+		#endif
+			FS_Path filePath=fsMakePath(PATH_ASCII, path);
+			FS_Archive script=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
+			Result ret = FSUSER_OpenFileDirectly(&fileHandle, script, filePath, FS_OPEN_READ, 0x00000000);
+			if (!ret){
+				FSFILE_GetSize(fileHandle, &size);
+				buffer = (unsigned char*)malloc(size+1);
+				FSFILE_Read(fileHandle, &bytesRead, 0x0, buffer, size);
+				buffer[size]=0;
+				FSFILE_Close(fileHandle);
+				svcCloseHandle(fileHandle);
+			}
+		#ifndef FORCE_SD
+		}else{
+			fseek(script, 0, SEEK_END);
+			int size = ftell(script);
+			fseek(script, 0, SEEK_SET);
+			buffer = (unsigned char*)malloc(size+1);
+			fread(buffer, size, 1, script);
+			fclose(script);
 			buffer[size]=0;
-			FSFILE_Close(fileHandle);
-			svcCloseHandle(fileHandle);
+		}
+		#endif
+		
+		// Start interpreter
+		if (buffer != NULL){
 			errMsg = runScript((const char*)buffer, true);
 			free(buffer);
 		}else errMsg = "index.lua file not found.";

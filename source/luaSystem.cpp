@@ -38,41 +38,22 @@
 #include "include/luaplayer.h"
 #include "include/graphics/Graphics.h"
 #include "include/Archives.h"
+#include "include/utils.h"
+extern "C"{
+	#include "include/brahma/brahma.h"
+}
 
 #define stringify(str) #str
 #define VariableRegister(lua, value) do { lua_pushinteger(lua, value); lua_setglobal (lua, stringify(value)); } while(0)
-
-typedef struct{
-	u16 name[0x106];		 ///< UTF-16 encoded name
-	u8	shortName[0x0A]; ///< 8.3 File name
-	u8	shortExt[0x04];	///< 8.3 File extension (set to spaces for directories)
-	u8	unknown2;				///< ???
-	u8	unknown3;				///< ???
-	u8	isDirectory;		 ///< Directory bit
-	u8	isHidden;				///< Hidden bit
-	u8	isArchive;			 ///< Archive bit
-	u8	isReadOnly;			///< Read-only bit
-	u64 fileSize;				///< File size
-} FS_dirent;
+#define MAX_RAM_ALLOCATION	10485760
 
 u16 OLD_3DS_CLOCK = 268;
 u16 NEW_3DS_CLOCK = 804;
 int current_clock = OLD_3DS_CLOCK;
 extern bool isNinjhax2;
+bool isTitleDatabaseInit = false;
 
 FS_Archive main_extdata_archive;
-
-void unicodeToChar(char* dst, u16* src){
-	if(!src || !dst)return;
-	while(*src)*(dst++)=(*(src++))&0xFF;
-	*dst=0x00;
-}
-
-void CharToUnicode(u16* dst, char* src){
-	if(!src || !dst)return;
-	while(*src)*(dst++)=(*src++);
-	*dst=0x00;
-}
 
 static int lua_exit(lua_State *L)
 {
@@ -92,22 +73,36 @@ static int lua_dofile (lua_State *L) {
 		if (argc != 1) return luaL_error(L, "wrong number of arguments");
 	#endif
 	const char *fname = luaL_checkstring(L, 1);
-	Handle fileHandle;
 	u64 size;
-	u32 bytesRead;
 	unsigned char *buffer;
-	FS_Path filePath=fsMakePath(PATH_ASCII, fname);
-	FS_Archive script=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
-	Result ret = FSUSER_OpenFileDirectly( &fileHandle, script, filePath, FS_OPEN_READ, 0x00000000);
-	#ifndef SKIP_ERROR_HANDLING
-		if (ret) return luaL_error(L, "script doesn't exist.");
-	#endif
-	FSFILE_GetSize(fileHandle, &size);
-	buffer = (unsigned char*)(malloc((size+1) * sizeof (char)));
-	FSFILE_Read(fileHandle, &bytesRead, 0x0, buffer, size);
-	buffer[size]=0;
-	FSFILE_Close(fileHandle);
-	svcCloseHandle(fileHandle);
+	if (strncmp("romfs:/",fname,7) == 0){	
+		FILE* script = fopen(fname,"r");
+		#ifndef SKIP_ERROR_HANDLING
+			if (script == NULL) return luaL_error(L, "script doesn't exist.");
+		#endif
+		fseek(script, 0, SEEK_END);
+		int size = ftell(script);
+		fseek(script, 0, SEEK_SET);
+		buffer = (unsigned char*)malloc(size+1);
+		fread(buffer, size, 1, script);
+		fclose(script);
+		buffer[size]=0;		
+	}else{
+		Handle fileHandle;
+		u32 bytesRead;
+		FS_Path filePath=fsMakePath(PATH_ASCII, fname);
+		FS_Archive script=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
+		Result ret = FSUSER_OpenFileDirectly( &fileHandle, script, filePath, FS_OPEN_READ, 0x00000000);
+		#ifndef SKIP_ERROR_HANDLING
+			if (ret) return luaL_error(L, "script doesn't exist.");
+		#endif
+		FSFILE_GetSize(fileHandle, &size);
+		buffer = (unsigned char*)malloc(size+1);
+		FSFILE_Read(fileHandle, &bytesRead, 0, buffer, size);
+		buffer[size]=0;
+		FSFILE_Close(fileHandle);
+		svcCloseHandle(fileHandle);
+	}
 	lua_settop(L, 1);
 	if (luaL_loadbuffer(L, (const char*)buffer, strlen((const char*)buffer), NULL) != LUA_OK)
 		return lua_error(L);
@@ -124,7 +119,7 @@ static int lua_openfile(lua_State *L)
 	#endif
 	const char *file_tbo = luaL_checkstring(L, 1);
 	int type = luaL_checkinteger(L, 2);
-	u64 archive_id;
+	u32 archive_id;
 	bool extdata = false;
 	if (argc == 3){
 		archive_id = luaL_checknumber(L,3);
@@ -132,7 +127,16 @@ static int lua_openfile(lua_State *L)
 	}
 	Handle fileHandle;
 	Result ret;
-	if (extdata){
+	fileStream* result;
+	if (strncmp("romfs:/",file_tbo,7) == 0){	
+		FILE* Handle = fopen(file_tbo,"r");
+		#ifndef SKIP_ERROR_HANDLING
+			if (Handle == NULL) return luaL_error(L, "file doesn't exist.");
+		#endif
+		result = (fileStream*)malloc(sizeof(fileStream));
+		result->handle = (u32)Handle;
+		result->isRomfs = true;
+	}else if (extdata){
 		FS_MediaType mtype;
 		FS_ArchiveID atype;
 		if (archive_id < 0x2000){
@@ -156,9 +160,15 @@ static int lua_openfile(lua_State *L)
 				ret = FSUSER_OpenFile( &fileHandle, main_extdata_archive, fsMakePath(PATH_ASCII, file_tbo), FS_OPEN_WRITE, 0);
 				break;
 		}
+		#ifndef SKIP_ERROR_HANDLING
+			if (ret) return luaL_error(L, "file doesn't exist.");
+		#endif
+		result = (fileStream*)malloc(sizeof(fileStream));
+		result->handle = (u32)fileHandle;
+		result->isRomfs = false;
 	}else{
-	FS_Archive sdmcArchive=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
-	FS_Path filePath=fsMakePath(PATH_ASCII, file_tbo);
+		FS_Archive sdmcArchive=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
+		FS_Path filePath=fsMakePath(PATH_ASCII, file_tbo);
 		switch(type){
 			case 0:
 				ret=FSUSER_OpenFileDirectly( &fileHandle, sdmcArchive, filePath, FS_OPEN_READ, 0x00000000);
@@ -170,9 +180,15 @@ static int lua_openfile(lua_State *L)
 				ret=FSUSER_OpenFileDirectly( &fileHandle, sdmcArchive, filePath, FS_OPEN_CREATE|FS_OPEN_WRITE, 0x00000000);
 				break;
 		}
-		//if(ret) return luaL_error(L, "error opening file");
+		#ifndef SKIP_ERROR_HANDLING
+			if (ret) return luaL_error(L, "file doesn't exist.");
+		#endif
+		result = (fileStream*)malloc(sizeof(fileStream));
+		result->handle = (u32)fileHandle;
+		result->isRomfs = false;
 	}
-	lua_pushinteger(L,fileHandle);
+	result->magic = 0xBEEFDEAD;
+	lua_pushinteger(L,(u32)result);
 	return 1;
 }
 
@@ -183,13 +199,21 @@ static int lua_checkexist(lua_State *L)
 		if (argc != 1) return luaL_error(L, "wrong number of arguments");
 	#endif
 	const char *file_tbo = luaL_checkstring(L, 1);
-	Handle fileHandle;
-	FS_Archive sdmcArchive=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
-	FS_Path filePath=fsMakePath(PATH_ASCII, file_tbo);
-	Result ret=FSUSER_OpenFileDirectly( &fileHandle, sdmcArchive, filePath, FS_OPEN_READ, 0x00000000);
-	if (!ret) FSFILE_Close(fileHandle);
-	svcCloseHandle(fileHandle);
-	lua_pushboolean(L,!ret);
+	if (strncmp("romfs:/",file_tbo,7) == 0){	
+		FILE* Handle = fopen(file_tbo,"r");
+		bool res = true;
+		if (Handle == NULL) res = false;
+		else fclose(Handle);
+		lua_pushboolean(L,res);
+	}else{
+		Handle fileHandle;
+		FS_Archive sdmcArchive=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
+		FS_Path filePath=fsMakePath(PATH_ASCII, file_tbo);
+		Result ret=FSUSER_OpenFileDirectly( &fileHandle, sdmcArchive, filePath, FS_OPEN_READ, 0x00000000);
+		if (!ret) FSFILE_Close(fileHandle);
+		svcCloseHandle(fileHandle);
+		lua_pushboolean(L,!ret);
+	}
 	return 1;
 }
 
@@ -335,10 +359,12 @@ static int lua_getsize(lua_State *L)
 	#ifndef SKIP_ERROR_HANDLING
 		if (argc != 1) return luaL_error(L, "wrong number of arguments");
 	#endif
-	Handle fileHandle = luaL_checkinteger(L, 1);
+	fileStream* file = (fileStream*)luaL_checkinteger(L, 1);
+	#ifndef SKIP_ERROR_HANDLING
+		if (file->magic != 0xBEEFDEAD) return luaL_error(L, "attempt to access wrong memory block type");
+	#endif
 	u64 size;
-	Result ret=FSFILE_GetSize(fileHandle, &size);
-	//if(ret) return luaL_error(L, "error getting size");
+	FS_GetSize(file, &size);
 	lua_pushinteger(L,size);
 	return 1;
 }
@@ -349,11 +375,14 @@ static int lua_closefile(lua_State *L)
 	#ifndef SKIP_ERROR_HANDLING
 		if ((argc != 1) && (argc != 2)) return luaL_error(L, "wrong number of arguments");
 	#endif
-	Handle fileHandle = luaL_checkinteger(L, 1);
-	Result ret=FSFILE_Close(fileHandle);
-	svcCloseHandle(fileHandle);
+	fileStream* file = (fileStream*)luaL_checkinteger(L, 1);
+	#ifndef SKIP_ERROR_HANDLING
+		if (file->magic != 0xBEEFDEAD) return luaL_error(L, "attempt to access wrong memory block type");
+	#endif
+	u64 size;
+	FS_Close(file);
 	if (argc == 2) FSUSER_CloseArchive( &main_extdata_archive);
-	//if(ret) return luaL_error(L, "error closing file");
+	free(file);
 	return 0;
 }
 
@@ -363,14 +392,16 @@ static int lua_readfile(lua_State *L)
 	#ifndef SKIP_ERROR_HANDLING
 		if (argc != 3) return luaL_error(L, "wrong number of arguments");
 	#endif
-	Handle fileHandle = luaL_checkinteger(L, 1);
+	fileStream* file = (fileStream*)luaL_checkinteger(L, 1);
+	#ifndef SKIP_ERROR_HANDLING
+		if (file->magic != 0xBEEFDEAD) return luaL_error(L, "attempt to access wrong memory block type");
+	#endif
 	u64 init = luaL_checkinteger(L, 2);
 	u64 size = luaL_checkinteger(L, 3);
+	unsigned char *buffer = (unsigned char*)malloc(size+1);
 	u32 bytesRead;
-	unsigned char *buffer = (unsigned char*)(malloc((size+1) * sizeof (char)));
-	Result ret=FSFILE_Read(fileHandle, &bytesRead, init, buffer, size);
+	FS_Read(file, &bytesRead, init, buffer, size);
 	buffer[size] = 0;
-	//if(ret || size!=bytesRead) return luaL_error(L, "error reading file");
 	lua_pushlstring(L,(const char*)buffer,size);
 	free(buffer);
 	return 1;
@@ -383,13 +414,19 @@ static int lua_writefile(lua_State *L)
 	#ifndef SKIP_ERROR_HANDLING
 		if (argc != 4) return luaL_error(L, "wrong number of arguments");
 	#endif
-	Handle fileHandle = luaL_checkinteger(L, 1);
+	fileStream* file = (fileStream*)luaL_checkinteger(L, 1);
+	#ifndef SKIP_ERROR_HANDLING
+		if (file->magic != 0xBEEFDEAD) return luaL_error(L, "attempt to access wrong memory block type");
+	#endif
 	u64 init = luaL_checkinteger(L, 2);
 	const char *text = luaL_checkstring(L, 3);
 	u64 size = luaL_checkinteger(L, 4);
-	u32 bytesWritten;
-	Result ret=FSFILE_Write(fileHandle, &bytesWritten, init, text, size, FS_WRITE_FLUSH);
-	//if(ret || size!=bytesWritten) return luaL_error(L, "error writing file");
+	if (file->isRomfs) luaL_error(L, "romFs partition is read-only");
+	else{
+		u32 bytesWritten;
+		Result ret=FSFILE_Write(file->handle, &bytesWritten, init, text, size, FS_WRITE_FLUSH);
+		//if(ret || size!=bytesWritten) return luaL_error(L, "error writing file");
+	}
 	return 0;
 }
 
@@ -582,7 +619,7 @@ static int lua_listdir(lua_State *L){
 			lua_pushinteger(L, i++);
 			lua_newtable(L);
 			lua_pushstring(L, "name");
-			unicodeToChar(&name[0],entry.name);
+			utf2ascii(&name[0],entry.name);
 			lua_pushstring(L, name);
 			lua_settable(L, -3);
 			lua_pushstring(L, "size");
@@ -750,20 +787,30 @@ static int lua_readsmdh(lua_State *L){
 	char name[64];
 	char desc[128];
 	char author[64];
-	Handle fileHandle;
+	fileStream tmp;
 	u32 bytesRead;
-	FS_Archive sdmcArchive=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
-	FS_Path filePath=fsMakePath(PATH_ASCII, file);
-	Result ret = FSUSER_OpenFileDirectly( &fileHandle, sdmcArchive, filePath, FS_OPEN_READ, 0x00000000);
-	#ifndef SKIP_ERROR_HANDLING
-		if (ret) return luaL_error(L, "file doesn't exist.");
-	#endif
+	if (strncmp("romfs:/",file,7) == 0){
+		tmp.isRomfs = true;
+		FILE* handle = fopen(file,"r");
+		#ifndef SKIP_ERROR_HANDLING
+			if (handle == NULL) return luaL_error(L, "file doesn't exist.");
+		#endif
+		tmp.handle = (u32)handle;
+	}else{
+		tmp.isRomfs = false;
+		FS_Archive sdmcArchive=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
+		FS_Path filePath=fsMakePath(PATH_ASCII, file);
+		Result ret = FSUSER_OpenFileDirectly( &tmp.handle, sdmcArchive, filePath, FS_OPEN_READ, 0x00000000);
+		#ifndef SKIP_ERROR_HANDLING
+			if (ret) return luaL_error(L, "file doesn't exist.");
+		#endif
+	}
 	u32 magic;
-	FSFILE_Read(fileHandle, &bytesRead, 0, &magic, 4);
+	FS_Read(&tmp, &bytesRead, 0, &magic, 4);
 	if (magic != 0x48444D53) return luaL_error(L, "error opening SMDH file.");
 	unsigned char *buffer = (unsigned char*)(malloc((129) * sizeof (char)));
 	buffer[128] = 0;
-	FSFILE_Read(fileHandle, &bytesRead, 8, buffer, 128);
+	FS_Read(&tmp, &bytesRead, 8, buffer, 128);
 	int i = 0;
 	while (i < 129){
 	if (buffer[i*2] == 0) break;
@@ -771,7 +818,7 @@ static int lua_readsmdh(lua_State *L){
 	i++;
 	}
 	name[i] = 0;
-	FSFILE_Read(fileHandle, &bytesRead, 392, buffer, 128);
+	FS_Read(&tmp, &bytesRead, 392, buffer, 128);
 	i = 0;
 	while (i < 129){
 	if (buffer[i*2] == 0) break;
@@ -782,7 +829,7 @@ static int lua_readsmdh(lua_State *L){
 	free(buffer);
 	buffer = (unsigned char*)(malloc((257) * sizeof (char)));
 	buffer[256] = 0;
-	FSFILE_Read(fileHandle, &bytesRead, 136, buffer, 256);
+	FS_Read(&tmp, &bytesRead, 136, buffer, 256);
 	i = 0;
 	while (i < 257){
 	if (buffer[i*2] == 0) break;
@@ -797,9 +844,8 @@ static int lua_readsmdh(lua_State *L){
 	bitmap->pixels = (u8*)malloc(6912);
 	bitmap->bitperpixel = 24;
 	u16* icon_buffer = (u16*)malloc(0x1200);
-	FSFILE_Read(fileHandle, &bytesRead, 0x24C0, icon_buffer, 0x1200);
-	FSFILE_Close(fileHandle);
-	svcCloseHandle(fileHandle);
+	FS_Read(&tmp, &bytesRead, 0x24C0, icon_buffer, 0x1200);
+	FS_Close(&tmp);
 	//convert RGB565 to RGB24
 		int x=0;
 		int y=0;
@@ -873,7 +919,7 @@ static int lua_launch(lua_State *L){
 	FSUSER_OpenArchive( &sdmcArchive);
 	Result ret = FSUSER_OpenFileDirectly( &hbHandle, sdmcArchive, fsMakePath(PATH_ASCII, file), FS_OPEN_READ, 0x00000000);
 	#ifndef SKIP_ERROR_HANDLING
-		if (ret) return luaL_error(L, "script doesn't exist.");
+		if (ret) return luaL_error(L, "file doesn't exist.");
 	#endif
 	if (isNinjhax2) __system_retAddr = launchFile_2x;
 	else{
@@ -898,7 +944,7 @@ static int lua_listExtdata(lua_State *L){
 	int z = 1;
 	Handle extdata_dir;
 	static char name[1024];
-	u64 i;
+	u32 i;
 	for (i=0; i<0x2000; ++i) {
 		u32 extdata_archive_lowpathdata[3] = {MEDIATYPE_SD, i, 0};
 		FS_Archive extdata_archive = (FS_Archive){ARCHIVE_EXTDATA, (FS_Path){PATH_BINARY, 0xC, (u8*)extdata_archive_lowpathdata}};
@@ -913,7 +959,7 @@ static int lua_listExtdata(lua_State *L){
 				lua_pushinteger(L, z++);
 				lua_newtable(L);
 				lua_pushstring(L, "name");
-				unicodeToChar(&name[0],entry.name);
+				utf2ascii(&name[0],entry.name);
 				lua_pushstring(L, name);
 				lua_settable(L, -3);
 				lua_pushstring(L, "size");
@@ -945,7 +991,7 @@ static int lua_listExtdata(lua_State *L){
 				lua_pushinteger(L, z++);
 				lua_newtable(L);
 				lua_pushstring(L, "name");
-				unicodeToChar(&name[0],entry.name);
+				utf2ascii(&name[0],entry.name);
 				lua_pushstring(L, name);
 				lua_settable(L, -3);
 				lua_pushstring(L, "size");
@@ -977,7 +1023,7 @@ static int lua_listExtdata(lua_State *L){
 				lua_pushinteger(L, z++);
 				lua_newtable(L);
 				lua_pushstring(L, "name");
-				unicodeToChar(&name[0],entry.name);
+				utf2ascii(&name[0],entry.name);
 				lua_pushstring(L, name);
 				lua_settable(L, -3);
 				lua_pushstring(L, "size");
@@ -1005,7 +1051,7 @@ static int lua_listExtdataDir(lua_State *L){
 		if (argc != 2) return luaL_error(L, "wrong number of arguments");
 	#endif
 	const char* path = luaL_checkstring(L, 1);
-	u64 archive_id = luaL_checknumber(L, 2);
+	u32 archive_id = luaL_checkinteger(L, 2);
 	lua_newtable(L);
 	int z = 1;
 	static char name[1024];
@@ -1034,7 +1080,7 @@ static int lua_listExtdataDir(lua_State *L){
 			lua_pushinteger(L, z++);
 			lua_newtable(L);
 			lua_pushstring(L, "name");
-			unicodeToChar(&name[0],entry.name);
+			utf2ascii(&name[0],entry.name);
 			lua_pushstring(L, name);
 			lua_settable(L, -3);
 			lua_pushstring(L, "size");
@@ -1058,49 +1104,65 @@ static int lua_listExtdataDir(lua_State *L){
 static int lua_installCia(lua_State *L){
 	int argc = lua_gettop(L);
 	#ifndef SKIP_ERROR_HANDLING
-		if (argc != 1) return luaL_error(L, "wrong number of arguments");
+		if (argc != 2) return luaL_error(L, "wrong number of arguments");
 	#endif
 	const char* path = luaL_checkstring(L, 1);
-	Handle fileHandle;
-	Handle ciaHandle;
-	u64 size;
-	int MAX_RAM_ALLOCATION = 10485760;
+	u8 mediatype = luaL_checkinteger(L, 2);
+	FS_MediaType media;
+	u64 size = 0;
 	u32 bytes;
-	FS_Archive sdmcArchive=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
-	FS_Path filePath=fsMakePath(PATH_ASCII, path);
-	Result ret = FSUSER_OpenFileDirectly( &fileHandle, sdmcArchive, filePath, FS_OPEN_READ, 0x00000000);
-	#ifndef SKIP_ERROR_HANDLING
-		if (ret) return luaL_error(L, "script doesn't exist.");
-	#endif
+	if (mediatype == 1) media = MEDIATYPE_SD;
+	else media = MEDIATYPE_NAND;
+	fileStream tmp;
+	Handle ciaHandle;
+	if (strncmp("romfs:/",path,7) == 0){
+		tmp.isRomfs = true;
+		FILE* handle = fopen(path,"r");
+		#ifndef SKIP_ERROR_HANDLING
+			if (handle == NULL) return luaL_error(L, "file doesn't exist.");
+		#endif
+		tmp.handle = (u32)handle;
+	}else{
+		tmp.isRomfs = false;
+		FS_Archive sdmcArchive=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
+		FS_Path filePath=fsMakePath(PATH_ASCII, path);
+		Result ret = FSUSER_OpenFileDirectly( &tmp.handle, sdmcArchive, filePath, FS_OPEN_READ, 0x00000000);
+		#ifndef SKIP_ERROR_HANDLING
+			if (ret) return luaL_error(L, "file doesn't exist.");
+		#endif
+	}
+	FS_GetSize(&tmp, &size);
 	amInit();
-	AM_StartCiaInstall(MEDIATYPE_SD, &ciaHandle);
-	FSFILE_GetSize(fileHandle, &size);
+	if (!isTitleDatabaseInit){
+		isTitleDatabaseInit = true;
+		AM_InitializeExternalTitleDatabase(false);
+	}
+	AM_StartCiaInstall(media, &ciaHandle);
 	if (size < MAX_RAM_ALLOCATION){
-		char* cia_buffer = (char*)(malloc((size) * sizeof (char)));
-		FSFILE_Read(fileHandle, &bytes, 0x0, cia_buffer, size);
-		FSFILE_Write(ciaHandle, &bytes, 0, cia_buffer, size, 0x10001);
+		u8* cia_buffer = (u8*)(malloc(size * sizeof (u8)));
+		FS_Read(&tmp, &bytes, 0, cia_buffer, size);
+		FSFILE_Write(ciaHandle, &bytes, 0, cia_buffer, size, 0);
 		free(cia_buffer);
 	}else{
 		u64 i = 0;
-		char* cia_buffer;
+		u8* cia_buffer;
 		while (i < size){
 			u64 bytesToRead;
 			if	(i+MAX_RAM_ALLOCATION > size){
-				cia_buffer = (char*)(malloc((size-i) * sizeof(char)));
+				cia_buffer = (u8*)malloc(size-i);
 				bytesToRead = size - i;
 			}else{
-				cia_buffer = (char*)(malloc((MAX_RAM_ALLOCATION) * sizeof(char)));
+				cia_buffer = (u8*)malloc(MAX_RAM_ALLOCATION);
 				bytesToRead = MAX_RAM_ALLOCATION;
 			}
-			FSFILE_Read(fileHandle, &bytes, i, cia_buffer, bytesToRead);
-			FSFILE_Write(ciaHandle, &bytes, i, cia_buffer, bytesToRead, 0x10001);
+			FS_Read(&tmp, &bytes, i, cia_buffer, bytesToRead);
+			FSFILE_Write(ciaHandle, &bytes, i, cia_buffer, bytesToRead, 0);
 			i = i + bytesToRead;
 			free(cia_buffer);
 		}
 	}
-	AM_FinishCiaInstall(MEDIATYPE_SD, &ciaHandle);
-	FSFILE_Close(fileHandle);
-	svcCloseHandle(fileHandle);
+	AM_FinishCiaInstall(media, &ciaHandle);
+	FS_Close(&tmp);
 	amExit();
 	return 0;
 }
@@ -1117,6 +1179,10 @@ static int lua_listCia(lua_State *L){
 		if (argc != 0) return luaL_error(L, "wrong number of arguments");
 	#endif
 	amInit();
+	if (!isTitleDatabaseInit){
+		isTitleDatabaseInit = true;
+		AM_InitializeExternalTitleDatabase(false);
+	}
 	u32 cia_nums;
 	AM_GetTitleCount(MEDIATYPE_SD, &cia_nums);
 	TitleId* TitleIDs = (TitleId*)malloc(cia_nums * sizeof(TitleId));
@@ -1213,6 +1279,10 @@ static int lua_uninstallCia(lua_State *L){
 	if (mediatype == 1) media = MEDIATYPE_SD;
 	else media = MEDIATYPE_NAND;
 	amInit();
+	if (!isTitleDatabaseInit){
+		isTitleDatabaseInit = true;
+		AM_InitializeExternalTitleDatabase(false);
+	}
 	u32 cia_nums;
 	AM_GetTitleCount(media, &cia_nums);
 	TitleId* TitleIDs = (TitleId*)malloc(cia_nums * sizeof(TitleId));
@@ -1223,10 +1293,6 @@ static int lua_uninstallCia(lua_State *L){
 	amExit();
 	free(TitleIDs);
 	return 0;
-}
-
-static u32 Endian_UInt32_Conversion(u32 value){
-	 return ((value >> 24) & 0x000000FF) | ((value >> 8) & 0x0000FF00) | ((value << 8) & 0x00FF0000) | ((value << 24) & 0xFF000000);
 }
 
 static int lua_ciainfo(lua_State *L){
@@ -1242,18 +1308,27 @@ static int lua_ciainfo(lua_State *L){
 	FS_Path filePath=fsMakePath(PATH_ASCII, file);
 	Result ret = FSUSER_OpenFileDirectly( &fileHandle, sdmcArchive, filePath, FS_OPEN_READ, 0x00000000);
 	#ifndef SKIP_ERROR_HANDLING
-		if (ret) return luaL_error(L, "script doesn't exist.");
+		if (ret) return luaL_error(L, "file doesn't exist.");
 	#endif
-	u32 unique_id;
+	AM_TitleEntry info;
+	amInit();
+	AM_GetCiaFileInfo(1, &info, fileHandle);
+	amExit();
 	FSFILE_Read(fileHandle, &bytesRead, 0x3A50, title, 16);
-	FSFILE_Read(fileHandle, &bytesRead, 0x2C20, &unique_id, 4);
 	lua_newtable(L);
 	lua_newtable(L);
 	lua_pushstring(L, "title");
 	lua_pushstring(L, title);
 	lua_settable(L, -3);
 	lua_pushstring(L, "unique_id");
-	lua_pushinteger(L, Endian_UInt32_Conversion(unique_id));
+	u64 unique_id = ((info.titleID << 32) >> 32);
+	lua_pushinteger(L, unique_id);
+	lua_settable(L, -3);
+	lua_pushstring(L, "version");
+	lua_pushinteger(L, info.version);
+	lua_settable(L, -3);
+	lua_pushstring(L, "install_size");
+	lua_pushnumber(L, info.size);
 	lua_settable(L, -3);
 	FSFILE_Close(fileHandle);
 	svcCloseHandle(fileHandle);
@@ -1279,10 +1354,15 @@ static int lua_ZipExtract(lua_State *L) {
 	strcpy(tmpPath2,"sdmc:");
 	strcat(tmpPath2,(char*)DirTe);
 	chdir(tmpPath2);
-	strcpy(tmpFile2,"sdmc:");
-	strcat(tmpFile2,(char*)FileToExtract);
+	if (strncmp("romfs:/",FileToExtract,7) == 0) strcpy(tmpFile2,FileToExtract);
+	else{
+		strcpy(tmpFile2,"sdmc:");
+		strcat(tmpFile2,(char*)FileToExtract);
+	}
 	Zip *handle = ZipOpen(tmpFile2);
-	if (handle == NULL) luaL_error(L, "error opening ZIP file.");
+	#ifndef SKIP_ERROR_HANDLING
+		if (handle == NULL) luaL_error(L, "error opening ZIP file.");
+	#endif
 	int result = ZipExtract(handle, Password);
 	ZipClose(handle);
 	sdmcExit();
@@ -1301,10 +1381,15 @@ static int lua_getfilefromzip(lua_State *L){
 	const char *Password = (argc == 4) ? luaL_checkstring(L, 4) : NULL;
 	char tmpFile2[1024];
 	sdmcInit();
-	strcpy(tmpFile2,"sdmc:");
-	strcat(tmpFile2,(char*)FileToExtract);
+	if (strncmp("romfs:/",FileToExtract,7) == 0) strcpy(tmpFile2,FileToExtract);
+	else{
+		strcpy(tmpFile2,"sdmc:");
+		strcat(tmpFile2,(char*)FileToExtract);
+	}
 	Zip *handle = ZipOpen(tmpFile2);
-	if (handle == NULL) luaL_error(L, "error opening ZIP file.");
+	#ifndef SKIP_ERROR_HANDLING
+		if (handle == NULL) luaL_error(L, "error opening ZIP file.");
+	#endif
 	ZipFile* file = ZipFileRead(handle, FileToExtract2, Password);
 	if (file == NULL) lua_pushboolean(L, false);
 	else{
@@ -1333,6 +1418,23 @@ static int lua_model(lua_State *L) {
 	CFGU_GetSystemModel(&model);
 	lua_pushinteger(L,model);
 	return 1;
+}
+
+static int lua_brahmaloader(lua_State *L) {
+	int argc = lua_gettop(L);
+	#ifndef SKIP_ERROR_HANDLING
+		if(argc != 2 ) return luaL_error(L, "wrong number of arguments.");
+	#endif
+	const char* file = luaL_checkstring(L, 1);
+	u32 offset = luaL_checkinteger(L, 2);
+	brahma_init();
+	load_arm9_payload_offset ((char*)file, offset, 0x10000);
+	firm_reboot();
+    brahma_exit();
+	char string[20];
+	strcpy(string,"lpp_exit_0456432");
+	luaL_dostring(L, "collectgarbage()");
+	return luaL_error(L, string); // NOTE: This is a fake error
 }
 	
 static int lua_syscall1(lua_State *L) {
@@ -1497,32 +1599,183 @@ static int lua_getdate(lua_State *L){
 	return 4;
 }
 
+static int lua_listnews(lua_State *L){
+	int argc = lua_gettop(L);
+	#ifndef SKIP_ERROR_HANDLING
+		if (argc != 0) return luaL_error(L, "wrong number of arguments");
+	#endif
+	lua_newtable(L);
+	u32 tot;
+	u32 i = 1;
+	newsInit();
+	NEWS_GetTotalNotifications(&tot);
+	while (i <= tot){
+		NotificationHeader header;
+		NEWS_GetNotificationHeader(i-1, &header);
+		char title[32];
+		utf2ascii(title,header.title);
+		lua_pushinteger(L, i);
+		lua_newtable(L);
+		lua_pushstring(L, "id");
+		lua_pushinteger(L, i-1);
+		lua_settable(L, -3);
+		lua_pushstring(L, "hasImage");
+		lua_pushboolean(L, header.enableJPEG);
+		lua_settable(L, -3);
+		lua_pushstring(L, "unread");
+		lua_pushboolean(L, header.unread);
+		lua_settable(L, -3);
+		lua_pushstring(L, "isSpotPass");
+		lua_pushboolean(L, header.isSpotPass);
+		lua_settable(L, -3);
+		lua_pushstring(L, "title");
+		lua_pushstring(L, title);
+		lua_settable(L, -3);
+		lua_settable(L, -3);
+		i++;
+	}
+	newsExit();
+	return 1;
+}
+
 static int lua_addnews(lua_State *L){
 	int argc = lua_gettop(L);
 	#ifndef SKIP_ERROR_HANDLING
-		if ((argc != 2) && (argc != 3)) return luaL_error(L, "wrong number of arguments");
+		if ((argc != 2) && (argc != 4)) return luaL_error(L, "wrong number of arguments");
 	#endif
 	const char *title = luaL_checkstring(L, 1);
 	const char *text = luaL_checkstring(L, 2);
-	u8* image = NULL; // TODO: Image support currently not working
+	u32* image = NULL;
 	u32 img_size = 0;
-	if (argc == 3){
-		Bitmap* file = (Bitmap*)luaL_checkinteger(L, 3);
-		#ifndef SKIP_ERROR_HANDLING
-			if (file->magic != 0x4C494D47) return luaL_error(L, "attempt to access wrong memory block type");
-		#endif
-		image = file->pixels;
-		img_size = file->width * file->height * 3;
+	bool hasImage = false;
+	bool processed = false;
+	Bitmap* file;
+	if (argc == 4){
+		bool isFile = lua_toboolean(L, 4);
+		if (isFile){
+			fileStream tmp;
+			const char *filename = luaL_checkstring(L, 3);
+			if (strncmp("romfs:/",filename,7) == 0){
+				tmp.isRomfs = true;
+				FILE* handle = fopen(filename,"r");
+				#ifndef SKIP_ERROR_HANDLING
+					if (handle == NULL) return luaL_error(L, "file doesn't exist.");
+				#endif
+			}else{
+				tmp.isRomfs = false;
+				FS_Path filePath=fsMakePath(PATH_ASCII, filename);
+				FS_Archive script=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
+				Result ret = FSUSER_OpenFileDirectly( &tmp.handle, script, filePath, FS_OPEN_READ, 0x00000000);
+				#ifndef SKIP_ERROR_HANDLING
+					if (ret) return luaL_error(L, "file doesn't exist.");
+				#endif
+			}
+			u16 magic;
+			u64 long_magic;
+			u32 bytesRead;
+			u64 size;
+			FS_Read(&tmp, &bytesRead, 0, &magic, 2);
+			if (magic == 0xD8FF){
+				FS_GetSize(&tmp, &size);
+				img_size = size;
+				if (img_size > 0x10000){
+					FS_Close(&tmp);
+					return luaL_error(L, "image is too big.");
+				}
+				u8* buffer = (u8*)malloc(img_size);
+				FS_Read(&tmp, &bytesRead, 0, buffer, img_size);
+				FS_Close(&tmp);
+				image = (u32*)buffer;
+				processed = true;
+			}else{
+				if (magic == 0x5089){
+					FS_Read(&tmp, &bytesRead, 0, &long_magic, 8);
+					FS_Close(&tmp);
+					if (long_magic == 0x0A1A0A0D474E5089) file = loadPng(filename);
+				}else if (magic == 0x4D42){
+					FS_Close(&tmp);
+					file = LoadBitmap((char*)filename);
+				}else{
+					FS_Close(&tmp);
+					return luaL_error(L, "wrong file format.");
+				}
+			}
+		}else{
+			file = (Bitmap*)luaL_checkinteger(L, 3);
+			#ifndef SKIP_ERROR_HANDLING
+				if (file->magic != 0x4C494D47) return luaL_error(L, "attempt to access wrong memory block type");
+			#endif
+		}
+		if (!processed){
+			u8 moltiplier = file->bitperpixel / 8;
+			u8* flip_pixels = (u8*)malloc((file->width)*(file->height)*moltiplier);
+			flip_pixels = flipBitmap(flip_pixels, file);
+			if (moltiplier == 4){ // 32bpp image - Need to delete alpha channel
+				u8* tmp = flip_pixels;
+				flip_pixels = (u8*)malloc((file->width)*(file->height)*3);
+				u32 i = 0;
+				u32 j = 0;
+				while ((i+1) < ((file->width)*(file->height)*(moltiplier))){
+					flip_pixels[j++] = tmp[i];
+					flip_pixels[j++] = tmp[i+1];
+					flip_pixels[j++] = tmp[i+2];
+					i = i + 4;
+				}
+				free(tmp);
+			}
+			image = toJpg(&img_size,(u32*)flip_pixels,file->width,file->height);
+			if (isFile){
+				free(file->pixels);
+				free(file);
+			}
+			if (img_size > 0x10000){
+				free(image);
+				return luaL_error(L, "image is too big.");
+			}
+		}
+		hasImage = true;
 	}
 	u16* uni_title = (u16*)malloc(strlen(title)*sizeof(u16));
 	u16* uni_text = (u16*)malloc(strlen(text)*sizeof(u16));
-	CharToUnicode(uni_title,(char*)title);
-	CharToUnicode(uni_text,(char*)text);
+	ascii2utf(uni_title,(char*)title);
+	ascii2utf(uni_text,(char*)text);
 	newsInit();
-	NEWS_AddNotification(uni_title, strlen(title), uni_text, strlen(text), image, img_size, false);
+	NEWS_AddNotification(uni_title, strlen(title), uni_text, strlen(text), image, img_size, hasImage);
+	if (image != NULL) free(image);
 	newsExit();
 	free(uni_title);
 	free(uni_text);
+	return 0;
+}
+
+static int lua_getnews(lua_State *L){
+	int argc = lua_gettop(L);
+	#ifndef SKIP_ERROR_HANDLING
+		if (argc != 1) return luaL_error(L, "wrong number of arguments");
+	#endif
+	u32 id = luaL_checkinteger(L, 1);
+	u16 message[0x1780];
+	char result[0x1780 * 2];
+	newsInit();
+	NEWS_GetNotificationMessage(id, message);
+	utf2ascii(result, message);
+	newsExit();
+	lua_pushstring(L, result);
+	return 1;
+}
+
+static int lua_erasenews(lua_State *L){
+	int argc = lua_gettop(L);
+	#ifndef SKIP_ERROR_HANDLING
+		if (argc != 1) return luaL_error(L, "wrong number of arguments");
+	#endif
+	u32 id = luaL_checkinteger(L, 1);
+	u16 message[0x1780];
+	char result[0x1780 * 2];
+	NotificationHeader header = { 0 };
+	newsInit();
+	NEWS_SetNotificationHeader(id, (const NotificationHeader*)&header);
+	newsExit();
 	return 0;
 }
 
@@ -1553,6 +1806,17 @@ static int lua_getcpu(lua_State *L){
 	return 1;
 }
 
+static int lua_detectsd(lua_State *L){
+	int argc = lua_gettop(L);
+	#ifndef SKIP_ERROR_HANDLING
+		if(argc != 0 ) return luaL_error(L, "wrong number of arguments.");
+	#endif
+	bool isSD;
+	FSUSER_IsSdmcDetected(&isSD);
+	lua_pushboolean(L, isSD);
+	return 1;
+}
+
 //Register our System Functions
 static const luaL_Reg System_functions[] = {
 	{"exit",				lua_exit},
@@ -1575,6 +1839,7 @@ static const luaL_Reg System_functions[] = {
 	{"startKeyboard",		lua_keyboard},
 	{"launch3DSX",			lua_launch},
 	{"launchCIA",			lua_launchCia},
+	{"launchPayload",		lua_brahmaloader},
 	{"extractSMDH",			lua_readsmdh},
 	{"scanExtdata",			lua_listExtdata},
 	{"listExtdataDir",		lua_listExtdataDir},
@@ -1594,10 +1859,14 @@ static const luaL_Reg System_functions[] = {
 	{"getDate",				lua_getdate},
 	{"getUsername",			lua_getUsername},
 	{"getBirthday",			lua_getBirth},
-	{"addNotification",		lua_addnews},
+	{"addNews",				lua_addnews},
+	{"listNews",			lua_listnews},
+	{"getNews",				lua_getnews},
+	{"eraseNews",			lua_erasenews},
 	{"setCpuSpeed",			lua_setcpu},
 	{"getCpuSpeed",			lua_getcpu},
 	{"extractFromZIP",		lua_getfilefromzip},
+	{"checkSDMC",			lua_detectsd},
 // I/O Module and Dofile Patch
 	{"openFile",			lua_openfile},
 	{"getFileSize",			lua_getsize},

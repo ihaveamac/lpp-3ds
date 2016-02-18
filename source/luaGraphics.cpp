@@ -32,8 +32,12 @@
 #- Special thanks to Aurelio for testing, bug-fixing and various help with codes and implementations -------------------#
 #-----------------------------------------------------------------------------------------------------------------------*/
 #include <3ds.h>
+#include <string.h>
 #include "include/luaplayer.h"
 #include "include/graphics/Graphics.h"
+#include "include/utils.h"
+#define stringify(str) #str
+#define VariableRegister(lua, value) do { lua_pushinteger(lua, value); lua_setglobal (lua, stringify(value)); } while(0)
 
 int cur_screen;
 
@@ -186,27 +190,37 @@ static int lua_loadimg(lua_State *L)
 		if (argc != 1) return luaL_error(L, "wrong number of arguments");
 	#endif
 	char* text = (char*)(luaL_checkstring(L, 1));
-	Handle fileHandle;
+	fileStream fileHandle;
 	u32 bytesRead;
 	u16 magic;
 	u64 long_magic;
-	FS_Path filePath = fsMakePath(PATH_ASCII, text);
-	FS_Archive script=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
-	FSUSER_OpenFileDirectly( &fileHandle, script, filePath, FS_OPEN_READ, 0x00000000);
-	FSFILE_Read(fileHandle, &bytesRead, 0, &magic, 2);
+	if (strncmp("romfs:/",text,7) == 0){
+		fileHandle.isRomfs = true;
+		FILE* handle = fopen(text,"r");
+		#ifndef SKIP_ERROR_HANDLING
+			if (handle == NULL) return luaL_error(L, "file doesn't exist.");
+		#endif
+		fileHandle.handle = (u32)handle;
+	}else{
+		fileHandle.isRomfs = false;
+		FS_Path filePath = fsMakePath(PATH_ASCII, text);
+		FS_Archive script=(FS_Archive){ARCHIVE_SDMC, (FS_Path){PATH_EMPTY, 1, (u8*)""}};
+		Result ret = FSUSER_OpenFileDirectly( &fileHandle.handle, script, filePath, FS_OPEN_READ, 0x00000000);
+		#ifndef SKIP_ERROR_HANDLING
+			if (ret) return luaL_error(L, "file doesn't exist.");
+		#endif
+	}
+	FS_Read(&fileHandle, &bytesRead, 0, &magic, 2);
 	Bitmap* bitmap;
 	if (magic == 0x5089){
-		FSFILE_Read(fileHandle, &bytesRead, 0, &long_magic, 8);
-		FSFILE_Close(fileHandle);
-		svcCloseHandle(fileHandle);
+		FS_Read(&fileHandle, &bytesRead, 0, &long_magic, 8);
+		FS_Close(&fileHandle);
 		if (long_magic == 0x0A1A0A0D474E5089) bitmap = decodePNGfile(text);
 	}else if (magic == 0x4D42){
-		FSFILE_Close(fileHandle);
-		svcCloseHandle(fileHandle);
+		FS_Close(&fileHandle);
 		bitmap = decodeBMPfile(text);
 	}else if (magic == 0xD8FF){
-		FSFILE_Close(fileHandle);
-		svcCloseHandle(fileHandle);
+		FS_Close(&fileHandle);
 		bitmap = decodeJPGfile(text);
 	}
 	#ifndef SKIP_ERROR_HANDLING
@@ -453,6 +467,21 @@ static int lua_getHeight(lua_State *L)
 	return 1;
 }
 
+static int lua_viewport(lua_State *L)
+{
+    int argc = lua_gettop(L);
+	#ifndef SKIP_ERROR_HANDLING
+		if (argc != 5) return luaL_error(L, "wrong number of arguments");
+	#endif
+	u32 x = luaL_checkinteger(L,1);
+	u32 y = luaL_checkinteger(L,2);
+	u32 w = luaL_checkinteger(L,3);
+	u32 h = luaL_checkinteger(L,4);
+	GPU_SCISSORMODE mode = (GPU_SCISSORMODE)luaL_checkinteger(L,5);
+	sf2d_set_scissor_test(mode, x, y, w, h);
+	return 0;
+}
+
 static int lua_pixel2(lua_State *L)
 {
     int argc = lua_gettop(L);
@@ -499,6 +528,7 @@ static const luaL_Reg Graphics_functions[] = {
   {"freeImage",				lua_free},
   {"getImageWidth",			lua_getWidth},
   {"getImageHeight",		lua_getHeight}, 
+  {"setViewport",			lua_viewport}, 
   {"getPixel",				lua_pixel2}, 
   {"convertFrom",			lua_convert},
   {0, 0}
@@ -508,4 +538,8 @@ void luaGraphics_init(lua_State *L) {
 	lua_newtable(L);
 	luaL_setfuncs(L, Graphics_functions, 0);
 	lua_setglobal(L, "Graphics");
+	u8 BORDER = 1;
+	u8 CENTER = 3;
+	VariableRegister(L,BORDER);
+	VariableRegister(L,CENTER);
 }
