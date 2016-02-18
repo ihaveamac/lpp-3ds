@@ -180,9 +180,9 @@ static int lua_openfile(lua_State *L)
 				ret=FSUSER_OpenFileDirectly( &fileHandle, sdmcArchive, filePath, FS_OPEN_CREATE|FS_OPEN_WRITE, 0x00000000);
 				break;
 		}
-		#ifndef SKIP_ERROR_HANDLING
+		/*#ifndef SKIP_ERROR_HANDLING
 			if (ret) return luaL_error(L, "file doesn't exist.");
-		#endif
+		#endif*/
 		result = (fileStream*)malloc(sizeof(fileStream));
 		result->handle = (u32)fileHandle;
 		result->isRomfs = false;
