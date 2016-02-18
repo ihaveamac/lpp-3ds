@@ -143,7 +143,10 @@ static int lua_download(lua_State *L){
 			free(buf);
 		}
 	#ifndef SKIP_ERROR_HANDLING
-		}else luaL_error(L, "error opening url");
+		}else{
+			httpcCloseContext(&context);
+			luaL_error(L, "error opening url");
+		}
 	#endif
 	httpcCloseContext(&context);
 	lua_pushinteger(L, statuscode);
@@ -180,7 +183,10 @@ static int lua_downstring(lua_State *L){
 		lua_pushlstring(L,(const char*)buffer,contentsize);
 		free(buffer);
 	#ifndef SKIP_ERROR_HANDLING
-		}else luaL_error(L, "error opening url");
+		}else{
+			httpcCloseContext(&context);
+			luaL_error(L, "error opening url");
+		}
 	#endif
 	httpcCloseContext(&context);
 	return 1;
